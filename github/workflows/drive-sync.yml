@@ -1,0 +1,267 @@
+name: drive-sync
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "run number in chain (leave 1)"
+        default: "1"
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: drive-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download from Drive, sort by course, push
+        id: sync
+        env:
+          DRIVE_API_KEY: ${{ secrets.DRIVE_API_KEY }}
+        run: |
+          pip install -q gdown
+          git config user.name "drive-sync-bot"
+          git config user.email "drive-sync-bot@users.noreply.github.com"
+          python3 - <<'PY'
+          import os, re, sys, json, time, hashlib, shutil, subprocess
+          import urllib.request, urllib.parse, urllib.error
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          FOLDERS = ["1sX4F2mDPUvayakLoqQkuFYE5YlesTg5N", "1gXD5cf3Sh80zlAW72S-BLo7PAxcUmcQM"]
+          KEY = os.environ.get("DRIVE_API_KEY", "").strip()
+          BUDGET = 5 * 3600 + 10 * 60      # stop cleanly before GitHub's 6 hour job limit
+          MAX_BYTES = 95 * 1024 * 1024     # GitHub rejects files over 100 MB
+          CHUNK = 200                      # files per commit
+          WORKERS = 6
+          START = time.time()
+
+          API = "https://www.googleapis.com/drive/v3/files"
+          FOLDER_MT = "application/vnd.google-apps.folder"
+          SHORTCUT_MT = "application/vnd.google-apps.shortcut"
+          NOISE = {"PART", "PAGE", "FILE", "LEC", "LECT", "CHAP", "UNIT", "SEC", "FIG", "TOP", "NO", "SET", "WEEK", "DAY"}
+          CODE_RE = re.compile(r"(?<![A-Za-z])([A-Za-z]{2,4})[\s_\-]?(\d{3})(?!\d)")
+
+
+          def find_code(text):
+              for m in CODE_RE.finditer(text):
+                  if m.group(1).upper() not in NOISE:
+                      return (m.group(1) + m.group(2)).upper()
+              return None
+
+
+          def course_code(name, path):
+              c = find_code(name)
+              if c:
+                  return c
+              for part in reversed([p for p in path.split("/") if p]):
+                  c = find_code(part)
+                  if c:
+                      return c
+              return "Other"
+
+
+          def http_get(url, tries=6):
+              last = None
+              for a in range(tries):
+                  try:
+                      with urllib.request.urlopen(url, timeout=120) as r:
+                          return r.read()
+                  except urllib.error.HTTPError as e:
+                      body = e.read()[:400]
+                      last = "HTTP %s %r" % (e.code, body)
+                      if e.code in (429, 500, 502, 503, 504) or (e.code == 403 and b"ateLimit" in body):
+                          time.sleep(min(60, 2 ** a))
+                          continue
+                      break
+                  except Exception as e:
+                      last = repr(e)
+                      time.sleep(min(60, 2 ** a))
+              raise RuntimeError(last)
+
+
+          def list_tree(root_id):
+              out, stack = [], [(root_id, "")]
+              while stack:
+                  fid, path = stack.pop()
+                  token = None
+                  while True:
+                      params = {
+                          "q": "'%s' in parents and trashed=false" % fid,
+                          "key": KEY,
+                          "pageSize": 1000,
+                          "fields": "nextPageToken,files(id,name,mimeType,size)",
+                          "supportsAllDrives": "true",
+                          "includeItemsFromAllDrives": "true",
+                      }
+                      if token:
+                          params["pageToken"] = token
+                      d = json.loads(http_get(API + "?" + urllib.parse.urlencode(params)))
+                      for f in d.get("files", []):
+                          if f["mimeType"] == FOLDER_MT:
+                              stack.append((f["id"], path + "/" + f["name"]))
+                          else:
+                              f["path"] = path
+                              out.append(f)
+                      token = d.get("nextPageToken")
+                      if not token:
+                          break
+              return out
+
+
+          def list_local():
+              import gdown
+              out = []
+              for i, fid in enumerate(FOLDERS):
+                  d = "/tmp/_dl/%d" % i
+                  try:
+                      gdown.download_folder(url="https://drive.google.com/drive/folders/" + fid,
+                                            output=d, quiet=True, use_cookies=False, remaining_ok=True)
+                  except Exception as e:
+                      print("gdown failed for", fid, e)
+                  for root, _, names in os.walk(d):
+                      rel = os.path.relpath(root, d)
+                      for n in names:
+                          p = os.path.join(root, n)
+                          out.append({"id": hashlib.md5(p.encode()).hexdigest(), "name": n,
+                                      "path": "" if rel == "." else rel, "mimeType": "",
+                                      "size": str(os.path.getsize(p)), "local": p})
+              return out
+
+
+          def fetch(item, dest):
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              tmp = dest + ".part"
+              try:
+                  if item.get("local"):
+                      shutil.copyfile(item["local"], tmp)
+                  else:
+                      if item["mimeType"].startswith("application/vnd.google-apps."):
+                          url = "%s/%s/export?%s" % (API, item["id"], urllib.parse.urlencode(
+                              {"mimeType": "application/pdf", "key": KEY}))
+                      else:
+                          url = "%s/%s?%s" % (API, item["id"], urllib.parse.urlencode(
+                              {"alt": "media", "supportsAllDrives": "true", "key": KEY}))
+                      data = http_get(url)
+                      with open(tmp, "wb") as fh:
+                          fh.write(data)
+                  os.replace(tmp, dest)
+              except Exception:
+                  if os.path.exists(tmp):
+                      os.remove(tmp)
+                  raise
+
+
+          def commit_push(msg):
+              subprocess.run(["git", "add", "-A"], check=True)
+              if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+                  return
+              subprocess.run(["git", "commit", "-q", "-m", msg], check=True)
+              branch = os.environ.get("GITHUB_REF_NAME", "main")
+              for a in range(4):
+                  if subprocess.run(["git", "push", "-q", "origin", "HEAD:" + branch]).returncode == 0:
+                      return
+                  time.sleep(5 * (a + 1))
+                  subprocess.run(["git", "pull", "-q", "--rebase", "origin", branch])
+              raise RuntimeError("git push failed")
+
+
+          def build_plan(files):
+              files = sorted(files, key=lambda f: (f["path"], f["name"], f["id"]))
+              used, plan = set(), []
+              for f in files:
+                  mt = f["mimeType"]
+                  if mt == SHORTCUT_MT:
+                      continue
+                  name = f["name"]
+                  if mt.startswith("application/vnd.google-apps."):
+                      if not name.lower().endswith(".pdf"):
+                          name += ".pdf"
+                  elif int(f.get("size") or 0) > MAX_BYTES:
+                      print("skip (over 95MB):", f["path"], f["name"])
+                      continue
+                  safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip(". ") or f["id"]
+                  if len(safe) > 150:
+                      stem, ext = os.path.splitext(safe)
+                      safe = stem[:140] + ext[:10]
+                  code = course_code(name, f["path"])
+                  dest = "%s/%s" % (code, safe)
+                  if dest.lower() in used:
+                      stem, ext = os.path.splitext(safe)
+                      dest = "%s/%s__%s%s" % (code, stem, f["id"][:6], ext)
+                  used.add(dest.lower())
+                  plan.append((f, dest))
+              return plan
+
+
+          def main():
+              print("mode:", "Drive API" if KEY else "gdown (no API key: max 50 files per folder)")
+              if KEY:
+                  files = []
+                  for fid in FOLDERS:
+                      files += list_tree(fid)
+              else:
+                  files = list_local()
+              print("files found in Drive:", len(files), flush=True)
+
+              plan = build_plan(files)
+              todo = [(f, d) for f, d in plan if not os.path.exists(d)]
+              print("planned %d, already in repo %d, to do %d" % (len(plan), len(plan) - len(todo), len(todo)), flush=True)
+
+              done = failed = 0
+              more = False
+              for i in range(0, len(todo), CHUNK):
+                  if time.time() - START > BUDGET:
+                      more = True
+                      print("time budget reached, continuing in a new run")
+                      break
+                  chunk = todo[i:i + CHUNK]
+                  with ThreadPoolExecutor(WORKERS) as ex:
+                      futs = {ex.submit(fetch, f, d): d for f, d in chunk}
+                      for fu in as_completed(futs):
+                          try:
+                              fu.result()
+                              done += 1
+                          except Exception as e:
+                              failed += 1
+                              print("FAILED", futs[fu], str(e)[:200])
+                  commit_push("Add files %d-%d of %d" % (i + 1, i + len(chunk), len(todo)))
+                  print("progress: %d added, %d failed, %d left" % (done, failed, len(todo) - i - len(chunk)), flush=True)
+
+              if failed and done and not more:
+                  more = True   # retry the failed ones in a fresh run
+
+              if not more:
+                  counts = {}
+                  for code in sorted(os.listdir(".")):
+                      if os.path.isdir(code) and not code.startswith("."):
+                          counts[code] = sum(len(fs) for _, _, fs in os.walk(code))
+                  lines = ["# VU files", "", "| Folder | Files |", "|---|---|"]
+                  lines += ["| %s | %d |" % (k, v) for k, v in counts.items()]
+                  lines += ["", "Total: %d" % sum(counts.values())]
+                  with open("README.md", "w") as fh:
+                      fh.write("\n".join(lines) + "\n")
+                  commit_push("Update README")
+                  print("ALL DONE. Total files:", sum(counts.values()))
+
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a") as fh:
+                      fh.write("more=%s\n" % ("true" if more else "false"))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Continue in a new run if work remains
+        if: steps.sync.outputs.more == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.event.inputs.n }}
+        run: |
+          if [ "${N:-1}" -lt 40 ]; then gh workflow run drive-sync.yml -f n=$((${N:-1}+1)); fi
